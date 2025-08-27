@@ -1,0 +1,201 @@
+name: Claude Command Runner
+
+# Usage in comments:
+# /claude-command <command-name> - Run a specific command
+# /claude-command - Run default code-review command
+# Available commands: code-review, security-audit, performance-check, documentation-review, test-coverage, refactor-suggestions
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: 'Command file to execute (e.g., code-review)'
+        required: true
+        type: choice
+        options:
+          - code-review
+          - security-audit
+          - performance-check
+          - documentation-review
+          - test-coverage
+          - refactor-suggestions
+          # Add more command options here as you create them
+      target_ref:
+        description: 'Git ref to check out (branch, tag, or commit)'
+        required: false
+        default: 'main'
+      additional_context:
+        description: 'Additional context or parameters for the command'
+        required: false
+  # pull_request:
+  #   types: [opened, synchronize, ready_for_review]
+  pull_request_review_comment:
+    types: [created]
+  issue_comment:
+    types: [created]
+
+jobs:
+  run-claude-command:
+    # Only run if manually triggered, PR is not draft, or comment contains "/claude-command"
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/claude-command')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '/claude-command'))
+    
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+      checks: write
+      id-token: write
+    
+    steps:
+      - name: Parse command from comment
+        if: github.event_name != 'workflow_dispatch'
+        id: parse-command
+        run: |
+          if [[ "${{ github.event_name }}" == "issue_comment" || "${{ github.event_name }}" == "pull_request_review_comment" ]]; then
+            COMMENT="${{ github.event.comment.body }}"
+            # Extract command name after /claude-command
+            COMMAND=$(echo "$COMMENT" | grep -oP '(?<=/claude-command\s+)\S+' | head -1)
+            
+            # If no command specified after /claude-command, use default
+            if [[ -z "$COMMAND" ]]; then
+              COMMAND="code-review"
+            fi
+            
+            echo "command=$COMMAND" >> $GITHUB_OUTPUT
+            echo "Command extracted: $COMMAND"
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Get PR context
+        if: github.event_name == 'pull_request' || github.event_name == 'pull_request_review_comment' || (github.event_name == 'issue_comment' && github.event.issue.pull_request)
+        id: pr-context
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${{ github.event_name }}" == "issue_comment" && -n "${{ github.event.issue.pull_request }}" ]]; then
+            PR_NUMBER=${{ github.event.issue.number }}
+          else
+            PR_NUMBER=${{ github.event.pull_request.number }}
+          fi
+          
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          
+          # Get PR details
+          PR_DATA=$(gh pr view $PR_NUMBER --json headRefName,baseRefName,files)
+          echo "head_ref=$(echo $PR_DATA | jq -r .headRefName)" >> $GITHUB_OUTPUT
+          echo "base_ref=$(echo $PR_DATA | jq -r .baseRefName)" >> $GITHUB_OUTPUT
+
+      - name: Read command file
+        id: read-command
+        run: |
+          COMMAND_NAME="${{ github.event_name == 'workflow_dispatch' && inputs.command || steps.parse-command.outputs.command }}"
+          COMMAND_FILE=".claude/commands/${COMMAND_NAME}.md"
+          
+          if [[ ! -f "$COMMAND_FILE" ]]; then
+            echo "Error: Command file $COMMAND_FILE not found"
+            exit 1
+          fi
+          
+          # Extract allowed-tools and description from frontmatter
+          ALLOWED_TOOLS=$(grep -A1 "allowed-tools:" "$COMMAND_FILE" | tail -1 | sed 's/^allowed-tools: //')
+          DESCRIPTION=$(grep -A1 "description:" "$COMMAND_FILE" | tail -1 | sed 's/^description: //')
+          
+          # Extract the content after frontmatter
+          COMMAND_CONTENT=$(sed -n '/^---$/,/^---$/!p' "$COMMAND_FILE" | tail -n +2)
+          
+          # Save to file for multi-line content
+          echo "$COMMAND_CONTENT" > command_content.txt
+          
+          echo "allowed_tools=$ALLOWED_TOOLS" >> $GITHUB_OUTPUT
+          echo "description=$DESCRIPTION" >> $GITHUB_OUTPUT
+
+      - name: Setup environment context
+        id: env-context
+        run: |
+          # Build environment context based on the workflow trigger
+          if [[ -n "${{ steps.pr-context.outputs.pr_number }}" ]]; then
+            echo "context_type=pull_request" >> $GITHUB_OUTPUT
+            echo "Building PR context..."
+            
+            # Get PR diff
+            gh pr diff ${{ steps.pr-context.outputs.pr_number }} > pr_diff.txt
+            
+            # Get changed files list
+            gh pr view ${{ steps.pr-context.outputs.pr_number }} --json files -q '.files[].path' > changed_files.txt
+          else
+            echo "context_type=commit" >> $GITHUB_OUTPUT
+            echo "Building commit context..."
+            
+            # Get commit diff
+            git diff HEAD~1 > commit_diff.txt
+          fi
+
+      - name: Run Claude Command
+        id: claude-command
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          
+          # Optional: Use Opus for more complex analysis
+          # model: "claude-opus-4-20250514"
+          
+          # Build the prompt with command content and context
+          direct_prompt: |
+            Execute the following command with the provided context:
+            
+            ${{ steps.read-command.outputs.description }}
+            
+            ## Command Instructions:
+            $(cat command_content.txt)
+            
+            ## Additional Context:
+            ${{ github.event_name == 'workflow_dispatch' && inputs.additional_context || '' }}
+            
+            ## Environment Information:
+            - Repository: ${{ github.repository }}
+            - Triggered by: ${{ github.event_name }}
+            - Actor: ${{ github.actor }}
+            ${{ steps.pr-context.outputs.pr_number && format('- PR Number: {0}', steps.pr-context.outputs.pr_number) || '' }}
+            ${{ steps.pr-context.outputs.head_ref && format('- Head Branch: {0}', steps.pr-context.outputs.head_ref) || '' }}
+            ${{ steps.pr-context.outputs.base_ref && format('- Base Branch: {0}', steps.pr-context.outputs.base_ref) || '' }}
+            
+            ## Available Context Files:
+            ${{ steps.env-context.outputs.context_type == 'pull_request' && '- PR diff available at: pr_diff.txt\n- Changed files list at: changed_files.txt' || '- Commit diff available at: commit_diff.txt' }}
+            
+            Please execute the command according to its instructions, using the provided context and available tools.
+          
+          # Pass through allowed tools from the command file
+          allowed_tools: "${{ steps.read-command.outputs.allowed_tools }},Read(pr_diff.txt),Read(changed_files.txt),Read(commit_diff.txt),Bash(gh pr comment),Bash(gh issue comment)"
+          
+          # Increase timeout for complex commands
+          timeout: 600
+
+      - name: Post results as comment
+        if: github.event_name != 'workflow_dispatch' && always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          COMMAND_NAME="${{ github.event_name == 'workflow_dispatch' && inputs.command || steps.parse-command.outputs.command }}"
+          STATUS="${{ steps.claude-command.outcome }}"
+          
+          if [[ "$STATUS" == "success" ]]; then
+            COMMENT="✅ Claude command \`$COMMAND_NAME\` completed successfully"
+          else
+            COMMENT="❌ Claude command \`$COMMAND_NAME\` failed"
+          fi
+          
+          if [[ -n "${{ steps.pr-context.outputs.pr_number }}" ]]; then
+            gh pr comment ${{ steps.pr-context.outputs.pr_number }} --body "$COMMENT"
+          elif [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            gh issue comment ${{ github.event.issue.number }} --body "$COMMENT"
+          fi
