@@ -1,0 +1,394 @@
+name: Claude Code Full Flow (Issue → PR)
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_description:
+        description: 'Brief description of what to build (e.g., "Add dark mode support")'
+        required: true
+        type: string
+      priority:
+        description: 'Priority level'
+        required: false
+        type: choice
+        options:
+          - low
+          - medium
+          - high
+          - critical
+        default: medium
+      labels:
+        description: 'Comma-separated labels (e.g., "enhancement,ui")'
+        required: false
+        type: string
+        default: ''
+      branch_prefix:
+        description: 'Branch name prefix for implementation'
+        required: false
+        type: string
+        default: 'feature'
+      draft_pr:
+        description: 'Create as draft PR?'
+        required: false
+        type: boolean
+        default: false
+      auto_implement:
+        description: 'Automatically implement after creating issue?'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  create-issue:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    outputs:
+      issue_number: ${{ steps.create-github-issue.outputs.issue_number }}
+      issue_url: ${{ steps.create-github-issue.outputs.issue_url }}
+      issue_title: ${{ steps.extract.outputs.issue_title }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code to Generate Issue
+        id: claude-issue
+        uses: anthropics/claude-code-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          mode: agent
+
+          # Optional: Specify model
+          # model: "claude-opus-4-20250514"
+
+          direct_prompt: |
+            Based on the following brief description, create a comprehensive GitHub issue:
+
+            **Description**: ${{ inputs.issue_description }}
+            **Priority**: ${{ inputs.priority }}
+
+            IMPORTANT: Your response MUST start with the following format EXACTLY:
+
+            TITLE: [Your clear, concise issue title here - max 80 characters]
+
+            [Then the rest of the issue body below]
+
+            Please analyze the codebase and create a detailed issue that includes:
+
+            1. **Problem Statement**:
+               - What problem does this solve?
+               - Why is this needed?
+               - Who benefits from this?
+
+            2. **Proposed Solution**:
+               - High-level approach
+               - Key technical considerations
+               - Affected files/components (reference actual files from the codebase)
+
+            3. **Technical Details**:
+               - Implementation steps
+               - API/interface changes needed
+               - Dependencies or prerequisites
+
+            4. **Acceptance Criteria**:
+               - Specific, testable requirements
+               - Definition of done
+
+            5. **Testing Strategy**:
+               - Unit tests needed
+               - Integration tests needed
+               - Manual testing steps
+
+            6. **Additional Context**:
+               - Related issues or PRs (if any)
+               - Documentation updates needed
+               - Migration or breaking changes
+
+            7. **Estimated Complexity**: (Small/Medium/Large/XL)
+
+            Please explore the codebase to understand the current architecture and provide
+            specific, actionable details. Reference actual file paths and existing patterns.
+
+            REMEMBER: Start your response with "TITLE: " followed by the issue title, then a blank line, then the issue body.
+
+          allowed_tools: "Read,Glob,Grep,Bash(git log),Bash(git grep)"
+
+      - name: Extract Issue Title and Body
+        id: extract
+        run: |
+          EXECUTION_FILE="${{ steps.claude-issue.outputs.execution_file }}"
+
+          if [ ! -f "$EXECUTION_FILE" ]; then
+            echo "Error: Execution file not found at $EXECUTION_FILE"
+            exit 1
+          fi
+
+          # Extract all text content from assistant messages
+          RESPONSE=$(jq -r '
+            [.[] |
+             select(.type == "assistant") |
+             .message.content[] |
+             select(.type == "text") |
+             .text
+            ] | join("\n\n")
+          ' "$EXECUTION_FILE")
+
+          echo "=== Extracted Response ==="
+          echo "$RESPONSE"
+          echo "=========================="
+
+          # Extract title
+          TITLE=$(echo "$RESPONSE" | grep -i '^TITLE:' | head -n 1 | sed 's/^TITLE: *//i;s/^[ \t]*//;s/[ \t]*$//')
+
+          if [ -z "$TITLE" ]; then
+            TITLE=$(echo "$RESPONSE" | grep -v '^\s*$' | head -n 1 | sed 's/^[#* ]*//;s/^[ \t]*//;s/[ \t]*$//')
+          fi
+
+          if [ -z "$TITLE" ]; then
+            TITLE="Issue: ${{ inputs.issue_description }}"
+          fi
+
+          # Extract body
+          BODY=$(echo "$RESPONSE" | sed -n '/^TITLE:/,$p' | tail -n +2 | sed '/./,$!d')
+
+          # Save to environment files
+          {
+            echo 'ISSUE_TITLE<<EOF'
+            echo "$TITLE"
+            echo 'EOF'
+          } >> "$GITHUB_ENV"
+
+          {
+            echo 'ISSUE_BODY<<EOF'
+            echo "$BODY"
+            echo ''
+            echo '---'
+            echo ''
+            echo '_This issue was automatically generated by Claude Code based on the description:_ `${{ inputs.issue_description }}`'
+            echo ''
+            echo '_Priority:_ ${{ inputs.priority }}'
+            echo 'EOF'
+          } >> "$GITHUB_ENV"
+
+          # Also output for next job
+          echo "issue_title=$TITLE" >> "$GITHUB_OUTPUT"
+          echo "Extracted title: $TITLE"
+
+      - name: Create GitHub Issue
+        id: create-github-issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labels = '${{ inputs.labels }}'.split(',').map(l => l.trim()).filter(l => l);
+
+            // Add priority label
+            const priorityLabel = 'priority: ${{ inputs.priority }}';
+            if (!labels.includes(priorityLabel)) {
+              labels.push(priorityLabel);
+            }
+
+            // Add auto-generated label
+            if (!labels.includes('auto-generated')) {
+              labels.push('auto-generated');
+            }
+
+            // Add implementation label if auto-implementing
+            if (${{ inputs.auto_implement }}) {
+              labels.push('auto-implementing');
+            }
+
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: process.env.ISSUE_TITLE,
+              body: process.env.ISSUE_BODY,
+              labels: labels
+            });
+
+            console.log(`Created issue #${issue.data.number}: ${issue.data.html_url}`);
+            core.setOutput('issue_number', issue.data.number);
+            core.setOutput('issue_url', issue.data.html_url);
+
+      - name: Issue Created Summary
+        run: |
+          echo "## ✅ Issue Created!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Issue #${{ steps.create-github-issue.outputs.issue_number }}**: ${{ env.ISSUE_TITLE }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URL**: ${{ steps.create-github-issue.outputs.issue_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ inputs.auto_implement }}" = "true" ]; then
+            echo "⏳ Moving to implementation phase..." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ℹ️  Auto-implementation is disabled. Run the 'Claude Code Issue to PR' workflow manually to implement." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  implement-issue:
+    needs: create-issue
+    if: inputs.auto_implement == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch Issue Details
+        id: fetch-issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.create-issue.outputs.issue_number }}
+            });
+
+            console.log(`Fetched issue #${issue.data.number}: ${issue.data.title}`);
+
+            const fs = require('fs');
+            fs.appendFileSync(process.env.GITHUB_ENV, `ISSUE_TITLE<<EOF\n${issue.data.title}\nEOF\n`);
+            fs.appendFileSync(process.env.GITHUB_ENV, `ISSUE_BODY<<EOF\n${issue.data.body || ''}\nEOF\n`);
+
+      - name: Run Claude Code to Implement Issue
+        id: claude-implement
+        uses: anthropics/claude-code-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          mode: agent
+
+          # Optional: Specify model
+          # model: "claude-opus-4-20250514"
+
+          direct_prompt: |
+            You are implementing GitHub issue #${{ needs.create-issue.outputs.issue_number }}.
+
+            **Issue Title**: ${{ env.ISSUE_TITLE }}
+
+            **Issue Description**:
+            ${{ env.ISSUE_BODY }}
+
+            **Your Task**:
+            1. **Research Phase**: Explore the codebase to understand:
+               - Current architecture and patterns
+               - Files and components that need modification
+               - Existing tests and testing patterns
+               - Dependencies and constraints
+
+            2. **Implementation Phase**:
+               - Create a new branch: `${{ inputs.branch_prefix }}/issue-${{ needs.create-issue.outputs.issue_number }}`
+               - Implement the solution following the issue requirements
+               - Follow existing code patterns and conventions
+               - Add or update tests as needed
+               - Ensure code quality and best practices
+
+            3. **Documentation Phase**:
+               - Update relevant documentation
+               - Add code comments where needed
+
+            4. **Commit Phase**:
+               - Create clear, descriptive commits
+               - Reference the issue in commits (e.g., "Fixes #${{ needs.create-issue.outputs.issue_number }}")
+
+            5. **PR Creation Phase**:
+               - Push the branch to origin
+               - Create a pull request with:
+                 - Clear title referencing the issue
+                 - Summary of changes made
+                 - Testing instructions
+                 - Any notes for reviewers
+               ${{ inputs.draft_pr && '- Mark the PR as DRAFT' || '' }}
+
+            **Important Guidelines**:
+            - If the issue is unclear or missing details, document assumptions in the PR
+            - If you encounter blockers, document them in the PR description
+            - Write clean, maintainable code that matches the project's style
+            - Ensure all tests pass before creating the PR
+
+            **Success Criteria**:
+            - Branch created and pushed
+            - Code implements the issue requirements
+            - Tests added/updated and passing
+            - PR created with clear description
+
+            Begin by exploring the codebase to understand what needs to be done!
+
+          allowed_tools: "Read,Write,Edit,Glob,Grep,Bash(git *),Bash(npm *),Bash(yarn *),Bash(pnpm *),Bash(python *),Bash(pytest),Bash(make *)"
+
+      - name: Extract PR Information
+        id: extract-pr
+        run: |
+          EXECUTION_FILE="${{ steps.claude-implement.outputs.execution_file }}"
+
+          if [ ! -f "$EXECUTION_FILE" ]; then
+            echo "Error: Execution file not found"
+            exit 1
+          fi
+
+          RESPONSE=$(jq -r '
+            [.[] |
+             select(.type == "assistant") |
+             .message.content[] |
+             select(.type == "text") |
+             .text
+            ] | join("\n\n")
+          ' "$EXECUTION_FILE")
+
+          echo "=== Claude Response ==="
+          echo "$RESPONSE"
+          echo "======================="
+
+          PR_URL=$(echo "$RESPONSE" | grep -oE 'https://github.com/[^/]+/[^/]+/pull/[0-9]+' | head -n 1)
+
+          if [ -n "$PR_URL" ]; then
+            echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+            echo "✅ PR created: $PR_URL"
+          else
+            echo "⚠️  Could not extract PR URL"
+            echo "pr_url=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment on Issue with PR Link
+        if: steps.extract-pr.outputs.pr_url != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prUrl = '${{ steps.extract-pr.outputs.pr_url }}';
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.create-issue.outputs.issue_number }},
+              body: `🤖 **Automated Implementation Complete**\n\nI've implemented this issue and created a pull request: ${prUrl}\n\nPlease review the changes and let me know if any adjustments are needed!`
+            });
+
+      - name: Final Summary
+        run: |
+          echo "## 🎉 Full Flow Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Issue Created" >> $GITHUB_STEP_SUMMARY
+          echo "**Issue #${{ needs.create-issue.outputs.issue_number }}**: ${{ needs.create-issue.outputs.issue_title }}" >> $GITHUB_STEP_SUMMARY
+          echo "**URL**: ${{ needs.create-issue.outputs.issue_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Implementation" >> $GITHUB_STEP_SUMMARY
+
+          if [ -n "${{ steps.extract-pr.outputs.pr_url }}" ]; then
+            echo "**Pull Request**: ${{ steps.extract-pr.outputs.pr_url }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ Successfully created and implemented issue with PR!" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️  Implementation completed but PR URL could not be extracted." >> $GITHUB_STEP_SUMMARY
+            echo "Check the Claude Code execution logs for details." >> $GITHUB_STEP_SUMMARY
+          fi
