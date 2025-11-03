@@ -41,25 +41,53 @@ Labels: "feature,security"
 
 ---
 
-### 2️⃣ Issue to PR (`claude-code-issue-to-pr.yml`)
+### 2️⃣ Issue to PR (`claude-code-pr-creator.yml`)
 
-**Trigger**: Manual (`workflow_dispatch`)
+**Triggers**: Multiple ways to trigger! Choose what works best for you:
 
-**What it does**: Implements any existing GitHub issue autonomously and creates a pull request.
+#### **Method 1: Manual (workflow_dispatch)**
+Run from GitHub Actions tab with issue number or URL
 
 **Inputs**:
-- `issue_number` - The issue number to implement (e.g., 42)
+- `issue_reference` - Issue number (e.g., `42`) OR full URL (e.g., `https://github.com/owner/repo/issues/42`)
 - `branch_prefix` - Branch name prefix (default: "feature")
 - `draft_pr` - Create as draft PR (default: false)
 
-**Example Use**:
+**Example**:
 ```
-Issue Number: 42
+Issue Reference: https://github.com/myorg/myrepo/issues/42
 Branch Prefix: feature
 Draft PR: false
 ```
 
-**What Claude Does**:
+#### **Method 2: Comment Trigger** 💬
+Just comment `/implement` on any issue!
+
+**Example**:
+```
+On issue #42, comment:
+/implement
+
+Optional parameters:
+/implement branch:fix draft:true
+```
+
+When you comment, the workflow will:
+- React with 🚀 emoji to confirm it received the command
+- Post a status comment when implementation starts
+- Post the PR link when done
+
+#### **Method 3: Label Trigger** 🏷️
+Add the `auto-implement` label to any issue
+
+**Example**:
+```
+1. Create or view an issue
+2. Add label: "auto-implement"
+3. Workflow automatically starts!
+```
+
+**What Claude Does** (all methods):
 1. **Research**: Explores codebase to understand architecture
 2. **Implementation**: Writes code following your patterns
 3. **Testing**: Adds/updates tests
@@ -162,7 +190,44 @@ Ready for Review!
 
 ## 💡 Usage Examples
 
-### Scenario 1: Manual Step-by-Step Control
+### Scenario 1: Comment-Triggered Implementation (Easiest!)
+
+**The most natural way to use this workflow:**
+
+1. **Create or find an issue** (manually or via Issue Creator workflow)
+   - Issue #123: "Add pagination to user list"
+
+2. **Simply comment `/implement`** on the issue
+   - Workflow starts automatically!
+   - You'll see a 🚀 reaction on your comment
+   - Bot comments: "🚀 Implementation Started..."
+
+3. **Wait for completion**
+   - Bot comments when PR is ready
+   - PR is automatically linked to the issue
+
+**Advanced**: Pass parameters in your comment:
+```
+/implement branch:fix draft:true
+```
+
+---
+
+### Scenario 2: Label-Triggered Implementation (Set and Forget)
+
+1. **Create issue** #123: "Add dark mode toggle"
+
+2. **Add label**: `auto-implement`
+   - Workflow triggers automatically
+   - No need to manually run anything!
+
+3. **PR appears** when implementation is done
+
+**Great for**: Issues you know you want automated immediately
+
+---
+
+### Scenario 3: Manual Workflow Control
 
 **Step 1**: Create an issue
 - Go to Actions → "Claude Code Issue Creator"
@@ -173,11 +238,13 @@ Ready for Review!
 - Read issue #123, make any manual adjustments
 
 **Step 3**: Implement when ready
-- Go to Actions → "Claude Code Issue to PR"
-- Enter issue number: 123
-- Run workflow → PR #45 created
+- **Option A**: Comment `/implement` on issue #123
+- **Option B**: Add label `auto-implement` to issue #123
+- **Option C**: Go to Actions → "Claude Code Issue to PR"
+  - Enter: `123` or `https://github.com/org/repo/issues/123`
+  - Run workflow → PR #45 created
 
-### Scenario 2: Fully Automated Development
+### Scenario 4: Fully Automated Development
 
 - Go to Actions → "Claude Code Full Flow"
 - Enter description: "Add email notifications for new messages"
@@ -185,13 +252,13 @@ Ready for Review!
 - Run workflow
 - ✅ Issue created + PR created in one flow!
 
-### Scenario 3: Existing Issues
+### Scenario 5: Existing Issues
 
-Have existing issues created manually? No problem!
+Have existing issues created manually? Perfect! Use any trigger method:
 
-- Go to Actions → "Claude Code Issue to PR"
-- Enter the issue number
-- Claude will implement it and create a PR
+- **Easiest**: Comment `/implement` on the existing issue
+- **Alternative**: Add the `auto-implement` label
+- **Manual**: Run "Issue to PR" workflow with the issue number/URL
 
 ---
 
@@ -228,6 +295,14 @@ Customize branch prefixes:
 - `fix` → `fix/issue-42`
 - `enhancement` → `enhancement/issue-42`
 
+### Trigger Methods Quick Reference
+
+| Method | How to Use | When to Use | Parameters |
+|--------|-----------|-------------|------------|
+| 💬 **Comment** | Comment `/implement` on issue | Most natural, everyday use | Optional: `branch:fix draft:true` |
+| 🏷️ **Label** | Add `auto-implement` label | Batch processing, automation | None (uses defaults) |
+| 🖱️ **Manual** | Run workflow from Actions tab | Need custom settings, testing | Full control over all settings |
+
 ---
 
 ## 🎓 How It Works
@@ -239,6 +314,33 @@ These workflows use `mode: agent`, which gives Claude:
 - **Tool Access**: Uses Read, Write, Git, Bash tools
 - **Research Capability**: Explores codebase before coding
 - **Decision Making**: Chooses best implementation approach
+
+### Multi-Trigger Architecture
+
+The Issue to PR workflow intelligently handles three different triggers:
+
+```
+Issue #42 Created
+       ↓
+   [3 Ways to Trigger Implementation]
+       ↓
+    ┌──────────────┬──────────────┬──────────────┐
+    │   Comment    │    Label     │   Manual     │
+    │  /implement  │ auto-implement│  Workflow   │
+    └──────────────┴──────────────┴──────────────┘
+           ↓              ↓              ↓
+      [check-trigger job validates and extracts issue number]
+           ↓
+      [implement-issue job does the actual work]
+           ↓
+    Branch → Code → Tests → Commit → PR → Comment
+```
+
+**Key features**:
+- Single workflow, multiple entry points
+- Consistent behavior across all triggers
+- Smart parameter parsing from comments
+- Status feedback for non-manual triggers
 
 ### Workflow Chaining
 

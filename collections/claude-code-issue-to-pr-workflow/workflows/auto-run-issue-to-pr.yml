@@ -1,0 +1,171 @@
+name: Claude Code Full Flow (Issue → PR)
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_description:
+        description: 'Brief description of what to build (e.g., "Add dark mode support")'
+        required: true
+        type: string
+      priority:
+        description: 'Priority level'
+        required: false
+        type: choice
+        options:
+          - low
+          - medium
+          - high
+          - critical
+        default: medium
+      labels:
+        description: 'Comma-separated labels (e.g., "enhancement,ui")'
+        required: false
+        type: string
+        default: ''
+      branch_prefix:
+        description: 'Branch name prefix for implementation'
+        required: false
+        type: string
+        default: 'feature'
+      draft_pr:
+        description: 'Create as draft PR?'
+        required: false
+        type: boolean
+        default: false
+      auto_implement:
+        description: 'Automatically implement after creating issue?'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  # Step 1: Create the issue (reusing logic from claude-code-issue-creator.yml)
+  create-issue:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    outputs:
+      issue_number: ${{ steps.create-github-issue.outputs.issue_number }}
+      issue_url: ${{ steps.create-github-issue.outputs.issue_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code to Generate Issue
+        id: claude-issue
+        uses: anthropics/claude-code-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          mode: agent
+          direct_prompt: |
+            Based on the following brief description, create a comprehensive GitHub issue:
+
+            **Description**: ${{ inputs.issue_description }}
+            **Priority**: ${{ inputs.priority }}
+
+            IMPORTANT: Your response MUST start with the following format EXACTLY:
+
+            TITLE: [Your clear, concise issue title here - max 80 characters]
+
+            [Then the rest of the issue body below]
+
+            Please analyze the codebase and create a detailed issue that includes:
+
+            1. **Problem Statement**: What problem does this solve? Why is this needed?
+            2. **Proposed Solution**: High-level approach and affected files
+            3. **Technical Details**: Implementation steps and API changes
+            4. **Acceptance Criteria**: Specific, testable requirements
+            5. **Testing Strategy**: Unit/integration tests needed
+            6. **Additional Context**: Related issues, docs, breaking changes
+            7. **Estimated Complexity**: (Small/Medium/Large/XL)
+
+            REMEMBER: Start with "TITLE: " followed by the title, then a blank line, then the body.
+          allowed_tools: "Read,Glob,Grep,Bash(git log),Bash(git grep)"
+
+      - name: Extract Issue Title and Body
+        id: extract
+        run: |
+          EXECUTION_FILE="${{ steps.claude-issue.outputs.execution_file }}"
+
+          RESPONSE=$(jq -r '[.[] | select(.type == "assistant") | .message.content[] | select(.type == "text") | .text] | join("\n\n")' "$EXECUTION_FILE")
+
+          TITLE=$(echo "$RESPONSE" | grep -i '^TITLE:' | head -n 1 | sed 's/^TITLE: *//i;s/^[ \t]*//;s/[ \t]*$//')
+          [ -z "$TITLE" ] && TITLE="Issue: ${{ inputs.issue_description }}"
+
+          BODY=$(echo "$RESPONSE" | sed -n '/^TITLE:/,$p' | tail -n +2 | sed '/./,$!d')
+
+          {
+            echo 'ISSUE_TITLE<<EOF'
+            echo "$TITLE"
+            echo 'EOF'
+            echo 'ISSUE_BODY<<EOF'
+            echo "$BODY"
+            echo ''
+            echo '---'
+            echo '_Auto-generated from:_ `${{ inputs.issue_description }}`'
+            echo 'EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Create GitHub Issue
+        id: create-github-issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labels = '${{ inputs.labels }}'.split(',').map(l => l.trim()).filter(l => l);
+            labels.push('priority: ${{ inputs.priority }}', 'auto-generated');
+            if (${{ inputs.auto_implement }}) labels.push('auto-implementing');
+
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: process.env.ISSUE_TITLE,
+              body: process.env.ISSUE_BODY,
+              labels: labels
+            });
+
+            core.setOutput('issue_number', issue.data.number);
+            core.setOutput('issue_url', issue.data.html_url);
+
+  # Step 2: Trigger implementation by adding comment (reusing claude-code-issue-to-pr.yml logic)
+  trigger-implementation:
+    needs: create-issue
+    if: inputs.auto_implement == true
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Trigger Implementation via Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Post /implement comment to trigger the issue-to-pr workflow
+            const comment = await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.create-issue.outputs.issue_number }},
+              body: '/implement branch:${{ inputs.branch_prefix }} draft:${{ inputs.draft_pr }}'
+            });
+
+            console.log(`Posted /implement comment on issue #${{ needs.create-issue.outputs.issue_number }}`);
+            console.log(`The claude-code-issue-to-pr workflow will handle the implementation automatically.`);
+
+      - name: Summary
+        run: |
+          echo "## 🎉 Full Flow Triggered!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Issue Created**: #${{ needs.create-issue.outputs.issue_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "**URL**: ${{ needs.create-issue.outputs.issue_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Posted \`/implement\` comment to trigger automatic implementation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "The **claude-code-issue-to-pr** workflow will now:" >> $GITHUB_STEP_SUMMARY
+          echo "1. Research the codebase" >> $GITHUB_STEP_SUMMARY
+          echo "2. Implement the solution" >> $GITHUB_STEP_SUMMARY
+          echo "3. Create a pull request" >> $GITHUB_STEP_SUMMARY
+          echo "4. Link the PR back to the issue" >> $GITHUB_STEP_SUMMARY
